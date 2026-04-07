@@ -1,0 +1,67 @@
+name: readverse
+description: "ReadVerse - A complete document reader app for PDF and EPUB files."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # PDF & EPUB
+  syncfusion_flutter_pdfviewer: ^27.1.48
+  syncfusion_flutter_pdf: ^27.1.48
+  epub_view: ^3.2.0
+
+  # Text / Markdown / Docx readers
+  flutter_markdown: ^0.7.4
+  docx_file_viewer: ^0.0.7
+
+  # TTS
+  flutter_tts: ^4.2.0
+
+  # Recording & Playback
+  just_audio: ^0.9.42
+
+  # File handling
+  file_picker: ^8.1.7
+  path_provider: ^2.1.5
+
+  # Local storage
+  hive_flutter: ^1.1.0
+  shared_preferences: ^2.3.3
+
+  # Networking
+  http: ^1.2.2
+
+  # State management
+  provider: ^6.1.2
+
+  # Navigation
+  go_router: ^14.6.2
+
+  # Animation
+  lottie: ^3.1.3
+
+  # Utilities
+  intl: ^0.19.0
+  uuid: ^4.5.1
+  timeago: ^3.7.0
+  path: ^1.9.0
+  archive: ^3.6.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  hive_generator: ^2.0.1
+  build_runner: ^2.4.13
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/animations/
+    - assets/images/
