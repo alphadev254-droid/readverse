@@ -11,6 +11,7 @@ import '../screens/document_details/document_details_screen.dart';
 import '../screens/settings/settings_screen.dart';
 import '../screens/library/library_management_screen.dart';
 import '../screens/favorites/favorites_screen.dart';
+import '../screens/legal/privacy_policy_screen.dart';
 
 final _rootNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -77,6 +78,14 @@ GoRouter createRouter(AuthProvider authProvider) {
       GoRoute(
         path: '/favorites',
         pageBuilder: (_, state) => _fadePage(state, const FavoritesScreen()),
+      ),
+      GoRoute(
+        path: '/privacy-policy',
+        pageBuilder: (_, state) => _fadePage(state, const PrivacyPolicyScreen()),
+      ),
+      GoRoute(
+        path: '/terms-of-service',
+        pageBuilder: (_, state) => _fadePage(state, const TermsOfServiceScreen()),
       ),
     ],
   );

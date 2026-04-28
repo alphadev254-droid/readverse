@@ -27,7 +27,7 @@ class _DocxReaderState extends State<DocxReader> {
   bool _pageInfoSet = false;
   bool _isNavigating = false;
   int _totalPages = 1;
-  int _lastReportedPage = 1;
+  int _currentPage = 1;
 
   @override
   void initState() {
@@ -49,11 +49,15 @@ class _DocxReaderState extends State<DocxReader> {
       _pageInfoSet = true;
       final bytes = widget.document.fileSizeBytes;
       _totalPages = ((bytes / 2) / 3000).ceil().clamp(1, 9999);
-      final rp = context.read<ReaderProvider>();
-      rp.setTotalPages(_totalPages);
-      rp.setPage(1);
-      // Register so PageSlider.onChanged drives us instantly
-      rp.registerSliderDragCallback(_scrollToFraction);
+      
+      // Defer provider calls to avoid setState during build
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final rp = context.read<ReaderProvider>();
+        rp.setTotalPages(_totalPages);
+        rp.setPage(1);
+        // Register so PageSlider.onChanged drives us instantly
+        rp.registerSliderDragCallback(_scrollToFraction);
+      });
     }
   }
 
@@ -64,40 +68,68 @@ class _DocxReaderState extends State<DocxReader> {
     super.dispose();
   }
 
-  // Called by scroll notifications — updates slider smoothly on every frame
+  // Called by scroll notifications — updates page and slider on page changes only
   void _onScrollUpdate() {
     if (_isNavigating) return;
     if (!_scrollController.hasClients) return;
     final max = _scrollController.position.maxScrollExtent;
     if (max <= 0) return;
-    final fraction = (_scrollController.offset / max).clamp(0.0, 1.0);
-    if (mounted) {
-      context.read<ReaderProvider>().setScrollFraction(fraction);
+    
+    // Calculate current page based on scroll position
+    final scrollFraction = (_scrollController.offset / max).clamp(0.0, 1.0);
+    final newPage = (scrollFraction * _totalPages).ceil().clamp(1, _totalPages);
+    
+    // Only update if page changed
+    if (newPage != _currentPage) {
+      _currentPage = newPage;
+      if (mounted) {
+        context.read<ReaderProvider>().setPage(_currentPage);
+        // Use page midpoint for slider position
+        final sliderFraction = ((_currentPage - 0.5) / _totalPages).clamp(0.0, 1.0);
+        context.read<ReaderProvider>().setScrollFraction(sliderFraction);
+      }
     }
   }
 
-  // Called by onPageChanged callback (next/prev buttons → animated)
-  // Called by onScrollFraction callback (slider drag → instant)
+  // Called by onPageChanged callback (next/prev buttons)
+  // Called by onScrollFraction callback (slider drag)
   Future<void> _scrollToPage(int targetPage) async {
     if (!_scrollController.hasClients) return;
     final page = targetPage.clamp(1, _totalPages);
-    _lastReportedPage = page;
+    _currentPage = page;
+    _isNavigating = true;
 
     final max = _scrollController.position.maxScrollExtent;
     final fraction = _totalPages > 1 ? (page - 1) / (_totalPages - 1) : 0.0;
     final target = (fraction * max).clamp(0.0, max);
 
-    // Instant jump — no animation lag fighting the slider finger
     _scrollController.jumpTo(target);
+    
+    // Release navigation lock
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (mounted) _isNavigating = false;
+    });
   }
 
-  // Called by slider drag via setScrollFraction — instant scroll
+  // Called by slider drag — converts fraction to page and scrolls
   void _scrollToFraction(double fraction) {
     if (!_scrollController.hasClients) return;
+    _isNavigating = true;
+    
+    // Convert fraction to target page
+    final targetPage = ((fraction * _totalPages) + 0.5).floor().clamp(1, _totalPages);
+    _currentPage = targetPage;
+    
     final max = _scrollController.position.maxScrollExtent;
-    if (max <= 0) return;
-    final target = (fraction * max).clamp(0.0, max);
+    final pageFraction = _totalPages > 1 ? (targetPage - 1) / (_totalPages - 1) : 0.0;
+    final target = (pageFraction * max).clamp(0.0, max);
+    
     _scrollController.jumpTo(target);
+    
+    // Release navigation lock
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (mounted) _isNavigating = false;
+    });
   }
 
   @override
@@ -118,7 +150,21 @@ class _DocxReaderState extends State<DocxReader> {
             builder: (context, snapshot) {
               if (snapshot.connectionState == ConnectionState.waiting) {
                 return Center(
-                    child: CircularProgressIndicator(color: cs.primary));
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CircularProgressIndicator(color: cs.primary),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Loading Word document...',
+                        style: TextStyle(
+                          color: textColor.withValues(alpha: 0.6),
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
               }
               if (snapshot.hasError ||
                   !snapshot.hasData ||
@@ -158,7 +204,12 @@ class _DocxReaderState extends State<DocxReader> {
                     },
                     child: ListView(
                       controller: _scrollController,
-                      padding: const EdgeInsets.fromLTRB(16, 24, 16, 120),
+                      padding: EdgeInsets.fromLTRB(
+                        16, 
+                        MediaQuery.of(context).padding.top + 80, // Status bar + top bar height
+                        16, 
+                        120
+                      ),
                       children: snapshot.requireData
                           .map((w) => DefaultTextStyle.merge(
                                 style: TextStyle(color: textColor),

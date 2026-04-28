@@ -66,17 +66,23 @@ class _EpubReaderState extends State<EpubReader> {
       );
     }
     // No GestureDetector — toggle controls handled by ReaderScreen overlay
-    return EpubView(
-      controller: _epubController!,
-      onChapterChanged: (value) {
-        if (value != null) {
-          context.read<ReaderProvider>().setPage(value.position.index);
-        }
-      },
-      onDocumentLoaded: (document) {
-        final total = document.Chapters?.length ?? 0;
-        context.read<ReaderProvider>().setTotalPages(total);
-      },
+    return Padding(
+      padding: EdgeInsets.only(
+        top: MediaQuery.of(context).padding.top + 80, // Status bar + top bar height
+        bottom: 120, // Bottom controls space
+      ),
+      child: EpubView(
+        controller: _epubController!,
+        onChapterChanged: (value) {
+          if (value != null) {
+            context.read<ReaderProvider>().setPage(value.position.index);
+          }
+        },
+        onDocumentLoaded: (document) {
+          final total = document.Chapters?.length ?? 0;
+          context.read<ReaderProvider>().setTotalPages(total);
+        },
+      ),
     );
   }
 }

@@ -1,20 +1,25 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../models/recording_model.dart';
+import '../services/text_normalizer.dart';
+import '../services/http_chunk_fetcher.dart';
+import '../models/tts_chunk.dart';
 
 const String _recordingsBox = 'recordings_box';
 
 enum RecordingState { idle, synthesizing, playing, playerPaused }
 
 class RecordingProvider extends ChangeNotifier {
-  // Shared TTS instance — injected from ReadAloudProvider so there is
-  // only ever ONE FlutterTts engine in the app.
+  // Dedicated TTS instance for recording — NEVER share with ReadAloudProvider
+  // This eliminates handler ownership conflicts
   FlutterTts? _tts;
   final AudioPlayer _player = AudioPlayer();
 
@@ -29,6 +34,19 @@ class RecordingProvider extends ChangeNotifier {
   bool _stopRequested = false;
   String _sessionId = '';
 
+  // Online synthesis session
+  int _onlineChunksReceived = 0;
+  int _onlineTotalChunks = 0;
+  StreamSubscription<TtsChunk>? _onlineFetchSubscription;
+  HttpChunkFetcher? _onlineFetcher;
+
+  // Playback speed
+  double _playbackSpeed = 1.0;
+
+  // Favorites and library (stored in SharedPreferences, no model migration needed)
+  Set<String> _favoriteIds = {};
+  Set<String> _libraryIds = {};
+
   // Called when synthesis finishes — ReaderScreen listens to trigger save dialog
   void Function()? onSynthesisComplete;
 
@@ -41,14 +59,46 @@ class RecordingProvider extends ChangeNotifier {
   double get synthesisProgress => _sentences.isEmpty
       ? 0.0
       : (_currentSentenceIndex / _sentences.length).clamp(0.0, 1.0);
+  // Online synthesis progress
+  int get onlineChunksReceived => _onlineChunksReceived;
+  int get onlineTotalChunks => _onlineTotalChunks;
+  double get onlineSynthesisProgress => _onlineTotalChunks == 0
+      ? 0.0
+      : (_onlineChunksReceived / _onlineTotalChunks).clamp(0.0, 1.0);
 
   RecordingProvider() {
     _initStorage();
+    _initTts();
   }
 
-  /// Inject the shared TTS engine from ReadAloudProvider.
+  /// Initialize dedicated TTS engine for recording
+  Future<void> _initTts() async {
+    _tts = FlutterTts();
+    await _tts!.setVolume(1.0);
+    await _tts!.setPitch(1.0);
+    
+    // Use highest-quality voice on iOS if available
+    if (!kIsWeb && Platform.isIOS) {
+      final voices = await _tts!.getVoices as List?;
+      if (voices != null) {
+        final premium = voices.firstWhere(
+          (v) => (v['quality'] ?? '').toString().contains('enhanced'),
+          orElse: () => null,
+        );
+        if (premium != null) {
+          await _tts!.setVoice({
+            'name': premium['name'],
+            'locale': premium['locale'],
+          });
+        }
+      }
+    }
+  }
+
+  /// Legacy method for compatibility - no longer needed
+  @Deprecated('RecordingProvider now uses its own TTS engine')
   void setTts(FlutterTts tts) {
-    _tts = tts;
+    // No-op: we use our own engine now
   }
 
   Future<void> _initStorage() async {
@@ -65,6 +115,12 @@ class RecordingProvider extends ChangeNotifier {
         notifyListeners();
       }
     });
+
+    // Load favorites and library from prefs
+    final prefs = await SharedPreferences.getInstance();
+    _favoriteIds = Set<String>.from(prefs.getStringList('recording_favorites') ?? []);
+    _libraryIds = Set<String>.from(prefs.getStringList('recording_library') ?? []);
+    notifyListeners();
   }
 
   // ── Synthesis ──────────────────────────────────────────────────────────
@@ -73,13 +129,20 @@ class RecordingProvider extends ChangeNotifier {
       List<String> sentences, double speed, String language) async {
     if (sentences.isEmpty || _tts == null) return;
 
-    _sentences = sentences;
+    // Normalize all sentences for TTS before processing
+    final normalizedSentences = sentences
+        .map((s) => TextNormalizer.normalize(s))
+        .toList();
+
+    _sentences = normalizedSentences;
     _currentSentenceIndex = 0;
     _tempFiles = [];
     _stopRequested = false;
     _sessionId = const Uuid().v4();
     _state = RecordingState.synthesizing;
     notifyListeners();
+
+    debugPrint('[RecordingProvider] Normalized ${sentences.length} sentences for TTS');
 
     await _tts!.setLanguage(language);
     await _tts!.setSpeechRate(speed);
@@ -220,11 +283,108 @@ class RecordingProvider extends ChangeNotifier {
 
   Future<void> cancelSynthesis() async {
     _stopRequested = true;
+    // Cancel online fetch if active
+    _onlineFetcher?.cancel();
+    _onlineFetchSubscription?.cancel();
+    _onlineFetcher = null;
+    _onlineFetchSubscription = null;
     await _cleanupTempFiles();
     _state = RecordingState.idle;
     _sentences = [];
     _currentSentenceIndex = 0;
+    _onlineChunksReceived = 0;
+    _onlineTotalChunks = 0;
     notifyListeners();
+  }
+
+  /// Stream chunks from backend, collect all audio, then save as a recording file.
+  /// Shows the same progress banner as offline synthesis.
+  Future<void> startOnlineSynthesis({
+    required String text,
+    required String voiceId,
+    required String baseUrl,
+    double speed = 1.0,
+  }) async {
+    _stopRequested = false;
+    _onlineChunksReceived = 0;
+    _onlineTotalChunks = 0;
+    _tempFiles = [];
+    _sessionId = const Uuid().v4();
+    _sentences = []; // empty until we know total from isLast chunk
+    _currentSentenceIndex = 0;
+    _state = RecordingState.synthesizing;
+    notifyListeners();
+
+    final collectedChunks = <TtsChunk>[];
+
+    try {
+      _onlineFetcher = HttpChunkFetcher(baseUrl: baseUrl);
+      final stream = _onlineFetcher!.fetchChunks(
+        text: text,
+        voiceId: voiceId,
+        speed: speed,
+      );
+
+      final completer = Completer<void>();
+
+      _onlineFetchSubscription = stream.listen(
+        (chunk) {
+          if (_stopRequested) return;
+          collectedChunks.add(chunk);
+          _onlineChunksReceived++;
+          // totalChunks is now in every chunk frame — set it on first chunk
+          if (_onlineTotalChunks == 0 && chunk.totalChunks > 0) {
+            _onlineTotalChunks = chunk.totalChunks;
+            _sentences = List.filled(_onlineTotalChunks, '');
+          }
+          if (chunk.isLast && _onlineTotalChunks == 0) {
+            _onlineTotalChunks = chunk.index + 1;
+            _sentences = List.filled(_onlineTotalChunks, '');
+          }
+          _currentSentenceIndex = _onlineChunksReceived;
+          notifyListeners();
+        },
+        onDone: () => completer.complete(),
+        onError: (e) => completer.completeError(e),
+        cancelOnError: true,
+      );
+
+      await completer.future;
+
+    } catch (e) {
+      debugPrint('[RecordingProvider] Online synthesis error: $e');
+      _state = RecordingState.idle;
+      notifyListeners();
+      return;
+    } finally {
+      _onlineFetcher = null;
+      _onlineFetchSubscription = null;
+    }
+
+    if (_stopRequested || collectedChunks.isEmpty) {
+      _state = RecordingState.idle;
+      notifyListeners();
+      return;
+    }
+
+    // Assemble all chunks into temp WAV files for concatenation
+    final dir = await getTemporaryDirectory();
+    final tmpDir = Directory('${dir.path}/tts_$_sessionId');
+    await tmpDir.create(recursive: true);
+
+    for (final chunk in collectedChunks) {
+      final filePath = '${tmpDir.path}/chunk_${chunk.index.toString().padLeft(5, '0')}.wav';
+      // Chunk 0 already has a WAV header; chunks 1+ are raw PCM — wrap them
+      final wavBytes = chunk.index == 0
+          ? chunk.audioBytes
+          : _wrapPcmInWav(chunk.audioBytes, sampleRate: 22050, channels: 1, bitsPerSample: 16);
+      await File(filePath).writeAsBytes(wavBytes);
+      _tempFiles.add(filePath);
+    }
+
+    _state = RecordingState.idle;
+    notifyListeners();
+    Future.microtask(() => onSynthesisComplete?.call());
   }
 
   Future<RecordingModel?> saveRecording(String name) async {
@@ -396,6 +556,39 @@ class RecordingProvider extends ChangeNotifier {
     }
   }
 
+  /// Wrap raw PCM data in a minimal WAV header (22050 Hz, 16-bit, mono by default)
+  Uint8List _wrapPcmInWav(Uint8List pcmData, {
+    required int sampleRate,
+    required int channels,
+    required int bitsPerSample,
+  }) {
+    final dataSize = pcmData.length;
+    final byteRate = sampleRate * channels * (bitsPerSample ~/ 8);
+    final blockAlign = channels * (bitsPerSample ~/ 8);
+    final fileSize = dataSize + 36;
+
+    final header = <int>[
+      0x52, 0x49, 0x46, 0x46, // RIFF
+      fileSize & 0xFF, (fileSize >> 8) & 0xFF, (fileSize >> 16) & 0xFF, (fileSize >> 24) & 0xFF,
+      0x57, 0x41, 0x56, 0x45, // WAVE
+      0x66, 0x6D, 0x74, 0x20, // fmt
+      0x10, 0x00, 0x00, 0x00, // chunk size 16
+      0x01, 0x00,             // PCM
+      channels & 0xFF, (channels >> 8) & 0xFF,
+      sampleRate & 0xFF, (sampleRate >> 8) & 0xFF, (sampleRate >> 16) & 0xFF, (sampleRate >> 24) & 0xFF,
+      byteRate & 0xFF, (byteRate >> 8) & 0xFF, (byteRate >> 16) & 0xFF, (byteRate >> 24) & 0xFF,
+      blockAlign & 0xFF, (blockAlign >> 8) & 0xFF,
+      bitsPerSample & 0xFF, (bitsPerSample >> 8) & 0xFF,
+      0x64, 0x61, 0x74, 0x61, // data
+      dataSize & 0xFF, (dataSize >> 8) & 0xFF, (dataSize >> 16) & 0xFF, (dataSize >> 24) & 0xFF,
+    ];
+
+    final result = Uint8List(header.length + pcmData.length);
+    result.setAll(0, header);
+    result.setAll(header.length, pcmData);
+    return result;
+  }
+
   Future<void> _cleanupTempFiles() async {
     debugPrint('[RecordingProvider] Cleaning up ${_tempFiles.length} temp files');
     for (final path in _tempFiles) {
@@ -422,6 +615,31 @@ class RecordingProvider extends ChangeNotifier {
     }
   }
 
+  bool isFavorite(String id) => _favoriteIds.contains(id);
+  bool isInLibrary(String id) => _libraryIds.contains(id);
+
+  Future<void> toggleFavorite(String id) async {
+    if (_favoriteIds.contains(id)) {
+      _favoriteIds.remove(id);
+    } else {
+      _favoriteIds.add(id);
+    }
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('recording_favorites', _favoriteIds.toList());
+  }
+
+  Future<void> toggleLibrary(String id) async {
+    if (_libraryIds.contains(id)) {
+      _libraryIds.remove(id);
+    } else {
+      _libraryIds.add(id);
+    }
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('recording_library', _libraryIds.toList());
+  }
+
   // ── Playback ───────────────────────────────────────────────────────────
 
   Future<void> playRecording(RecordingModel recording) async {
@@ -432,26 +650,41 @@ class RecordingProvider extends ChangeNotifier {
     _state = RecordingState.playing;
     notifyListeners();
     await _player.setFilePath(recording.filePath);
+    await _player.setSpeed(_playbackSpeed);
+    await _player.setPitch(1.0);
     await _player.play();
   }
 
+  Future<void> setPlaybackSpeed(double speed) async {
+    _playbackSpeed = speed.clamp(0.5, 2.0);
+    await _player.setSpeed(_playbackSpeed);
+    await _player.setPitch(1.0);
+    notifyListeners();
+  }
+
+  Future<void> seekTo(Duration position) async {
+    await _player.seek(position);
+  }
+
+  double get playbackSpeed => _playbackSpeed;
+
   Future<void> pausePlayback() async {
-    await _player.pause();
     _state = RecordingState.playerPaused;
     notifyListeners();
+    await _player.pause();
   }
 
   Future<void> resumePlayback() async {
-    await _player.play();
     _state = RecordingState.playing;
     notifyListeners();
+    await _player.play();
   }
 
   Future<void> stopPlayback() async {
-    await _player.stop();
     _state = RecordingState.idle;
     _activeRecordingId = null;
     notifyListeners();
+    await _player.stop();
   }
 
   Stream<Duration> get positionStream => _player.positionStream;
@@ -491,6 +724,7 @@ class RecordingProvider extends ChangeNotifier {
   @override
   void dispose() {
     _player.dispose();
+    _tts?.stop();
     super.dispose();
   }
 }

@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -10,11 +11,16 @@ import '../../providers/library_provider.dart';
 import '../../providers/bookmark_provider.dart';
 import '../../providers/highlight_provider.dart';
 import '../../providers/read_aloud_provider.dart';
+import '../../providers/streaming_tts_provider.dart';
 import '../../providers/recording_provider.dart';
 import '../../models/document_model.dart';
 import '../../utils/extensions.dart';
 import '../../utils/doc_text_extractor.dart';
+import '../../services/online_tts_service.dart';
 import '../../widgets/read_aloud_bar.dart';
+import '../../widgets/online_tts_bar.dart';
+import '../../widgets/tts_mode_selector.dart';
+import '../../widgets/online_voice_picker.dart';
 import '../bookmarks/bookmarks_panel.dart';
 import '../highlights/highlights_panel.dart';
 import 'pdf_reader_controller.dart';
@@ -54,6 +60,22 @@ class _ReaderScreenState extends State<ReaderScreen> {
     }
     _document = doc;
     if (!mounted) return;
+    
+    // Check if there's active playback for a different document
+    final ttsProvider = context.read<ReadAloudProvider>();
+    if (ttsProvider.isActive && ttsProvider.docId != doc.id) {
+      // Stop playback of different document
+      await ttsProvider.stop();
+      await ttsProvider.clearPlaybackState();
+    }
+    
+    // Check if there's active online TTS for a different document
+    final streamingTtsProvider = context.read<StreamingTtsProvider>();
+    if (streamingTtsProvider.isActive && streamingTtsProvider.docId != doc.id) {
+      // Stop online TTS of different document
+      await streamingTtsProvider.stop();
+    }
+    
     await context.read<ReaderProvider>().openDocument(doc);
     if (!mounted) return;
     await context.read<BookmarkProvider>().loadBookmarks(doc.id);
@@ -64,7 +86,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
     try {
       final text = await DocTextExtractor.extract(doc.filePath);
       if (!mounted) return;
-      await context.read<ReadAloudProvider>().loadText(doc.id, text);
+      await context.read<ReadAloudProvider>().loadText(doc.id, text, docTitle: doc.name);
+      
+      // Load saved playback state if exists
+      if (!mounted) return;
+      await context.read<ReadAloudProvider>().loadPlaybackState();
     } catch (e) {
       debugPrint('[ReaderScreen] Text extraction failed: $e');
       if (mounted) {
@@ -85,7 +111,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void dispose() {
     _messenger = null;
     context.read<ReaderProvider>().closeDocument();
-    context.read<ReadAloudProvider>().stop();
     context.read<RecordingProvider>().onSynthesisComplete = null;
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
@@ -114,6 +139,79 @@ class _ReaderScreenState extends State<ReaderScreen> {
     showDialog(
       context: context,
       builder: (ctx) => _GenerateAudioDialog(docId: widget.docId),
+    );
+  }
+
+  Future<void> _showTtsModeSelector(BuildContext context, ReadAloudProvider tts) async {
+    await TtsModeSelector.show(
+      context,
+      onOfflineSelected: () async {
+        // Stop online TTS if active
+        final streamingTts = context.read<StreamingTtsProvider>();
+        if (streamingTts.isActive) {
+          await streamingTts.stop();
+        }
+        
+        // Use existing offline TTS (device TTS)
+        tts.play();
+      },
+      onOnlineSelected: () async {
+        // Stop offline TTS if active
+        if (tts.isActive) {
+          await tts.stop();
+        }
+        
+        // Show voice picker for online TTS
+        final selectedVoice = await OnlineVoicePicker.show(context);
+        
+        if (selectedVoice != null && context.mounted) {
+          // Initialize online TTS
+          final streamingTts = context.read<StreamingTtsProvider>();
+          final doc = _document;
+          
+          if (doc == null) return;
+          
+          // Extract full text
+          String fullText = '';
+          try {
+            if (doc.isPdf) {
+              fullText = await DocTextExtractor.extract(doc.filePath);
+            } else if (doc.isDocx) {
+              fullText = await DocTextExtractor.extract(doc.filePath);
+            } else if (doc.isTxt || doc.isMd) {
+              fullText = await File(doc.filePath).readAsString();
+            } else if (doc.isEpub) {
+              // TODO: Extract EPUB text
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('EPUB not yet supported for online TTS')),
+                );
+              }
+              return;
+            }
+            
+            if (fullText.isEmpty) {
+              throw Exception('No text found in document');
+            }
+            
+            // Initialize and start streaming TTS
+            await streamingTts.initialize(
+              docId: doc.id,
+              docTitle: doc.name,
+              fullText: fullText,
+              voiceId: selectedVoice.id,
+              speed: 1.0,
+            );
+            
+          } catch (e) {
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Failed to start online TTS: $e')),
+              );
+            }
+          }
+        }
+      },
     );
   }
 
@@ -192,7 +290,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 ),
               ),
 
-              // ── 4. Bottom: ReadAloudBar + ReaderControls ──
+              // ── 4. Bottom: ReadAloudBar + OnlineTtsBar + ReaderControls ──
               Positioned(
                 bottom: 0,
                 left: 0,
@@ -201,6 +299,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     const ReadAloudBar(),
+                    const OnlineTtsBar(),
                     ReaderControls(pageText: doc.name),
                   ],
                 ),
@@ -265,9 +364,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
                                 ? Icons.record_voice_over
                                 : Icons.record_voice_over_outlined,
                             tooltip: tts.isActive ? 'Stop Reading' : 'Read Aloud',
-                            onTap: () {
+                            onTap: () async {
                               if (tts.state == ReadAloudState.idle) {
-                                tts.play();
+                                // Show mode selector
+                                await _showTtsModeSelector(context, tts);
                               } else {
                                 tts.stop();
                               }
@@ -698,7 +798,7 @@ class _SynthesisProgressBanner extends StatelessWidget {
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    'Generating audio — ${rec.synthesizedCount} / ${rec.totalSentences} sentences',
+                    'Generating audio — ${rec.synthesizedCount} / ${rec.totalSentences > 0 ? rec.totalSentences : '?'}',
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w500,
@@ -745,7 +845,11 @@ class _GenerateAudioDialog extends StatefulWidget {
   State<_GenerateAudioDialog> createState() => _GenerateAudioDialogState();
 }
 
-class _GenerateAudioDialogState extends State<_GenerateAudioDialog> {
+class _GenerateAudioDialogState extends State<_GenerateAudioDialog>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+
+  // Offline state
   String _rangeOption = 'all';
   final _fromPageController = TextEditingController();
   final _toPageController = TextEditingController();
@@ -753,9 +857,15 @@ class _GenerateAudioDialogState extends State<_GenerateAudioDialog> {
   int _toPage = 1;
   String? _errorText;
 
+  // Online state
+  String _selectedVoiceId = 'en_US-lessac-high';
+  String _selectedQuality = 'high';
+
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _tabController.addListener(() => setState(() {})); // rebuild on tab switch
     final reader = context.read<ReaderProvider>();
     _fromPage = reader.currentPage;
     _toPage = reader.totalPages;
@@ -765,12 +875,13 @@ class _GenerateAudioDialogState extends State<_GenerateAudioDialog> {
 
   @override
   void dispose() {
+    _tabController.dispose();
     _fromPageController.dispose();
     _toPageController.dispose();
     super.dispose();
   }
 
-  void _validateAndGenerate() {
+  void _generateOffline() {
     final tts = context.read<ReadAloudProvider>();
     final rec = context.read<RecordingProvider>();
     final reader = context.read<ReaderProvider>();
@@ -782,7 +893,6 @@ class _GenerateAudioDialogState extends State<_GenerateAudioDialog> {
       return;
     }
 
-    // Validate custom range
     if (_rangeOption == 'custom') {
       if (_fromPage < 1 || _fromPage > totalPages) {
         setState(() => _errorText = 'From page must be between 1 and $totalPages');
@@ -801,18 +911,14 @@ class _GenerateAudioDialogState extends State<_GenerateAudioDialog> {
     Navigator.pop(context);
     tts.stop();
 
-    // Slice sentences by page range
     List<String> sentences;
     if (_rangeOption == 'all') {
       sentences = tts.sentences;
     } else if (_rangeOption == 'current') {
-      final fraction = totalPages > 1
-          ? (currentPage - 1) / (totalPages - 1)
-          : 0.0;
+      final fraction = totalPages > 1 ? (currentPage - 1) / (totalPages - 1) : 0.0;
       final startIdx = (fraction * tts.sentences.length).floor();
       sentences = tts.sentences.sublist(startIdx);
     } else {
-      // Custom range with improved mapping
       final f1 = totalPages > 1 ? ((_fromPage - 1) / (totalPages - 1)) : 0.0;
       final f2 = totalPages > 1 ? ((_toPage - 1) / (totalPages - 1)) : 1.0;
       final s1 = (f1 * tts.sentences.length).floor().clamp(0, tts.sentences.length);
@@ -828,103 +934,273 @@ class _GenerateAudioDialogState extends State<_GenerateAudioDialog> {
     rec.startSynthesis(sentences, tts.speed, 'en-US');
   }
 
+  Future<void> _generateOnline() async {
+    final doc = context.read<DocumentProvider>().getDocumentById(widget.docId);
+    if (doc == null) return;
+
+    Navigator.pop(context);
+
+    String fullText = '';
+    try {
+      fullText = await DocTextExtractor.extract(doc.filePath);
+    } catch (e) {
+      if (mounted) context.showSnackBar('Failed to extract text: $e', isError: true);
+      return;
+    }
+
+    if (fullText.isEmpty) {
+      if (mounted) context.showSnackBar('No text found in document', isError: true);
+      return;
+    }
+
+    if (!mounted) return;
+
+    final rec = context.read<RecordingProvider>();
+    final ttsService = OnlineTtsService();
+
+    final isHealthy = await ttsService.checkHealth();
+    if (!isHealthy) {
+      if (mounted) context.showSnackBar('Online TTS server not available', isError: true);
+      return;
+    }
+
+    await rec.startOnlineSynthesis(
+      text: fullText,
+      voiceId: _selectedVoiceId,
+      baseUrl: ttsService.baseUrl,
+      speed: 1.0,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final reader = context.read<ReaderProvider>();
     final totalPages = reader.totalPages;
+    final voices = PiperVoices.voices.where((v) => v.quality == _selectedQuality).toList();
 
     return AlertDialog(
-      title: const Text('Generate Audio'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('Select page range:', style: TextStyle(fontSize: 13)),
-          const SizedBox(height: 12),
-          RadioListTile<String>(
-            title: const Text('All pages'),
-            value: 'all',
-            groupValue: _rangeOption,
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-            onChanged: (v) => setState(() {
-              _rangeOption = v!;
-              _errorText = null;
-            }),
-          ),
-          RadioListTile<String>(
-            title: const Text('Current page onward'),
-            value: 'current',
-            groupValue: _rangeOption,
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-            onChanged: (v) => setState(() {
-              _rangeOption = v!;
-              _errorText = null;
-            }),
-          ),
-          RadioListTile<String>(
-            title: const Text('Custom range'),
-            value: 'custom',
-            groupValue: _rangeOption,
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-            onChanged: (v) => setState(() {
-              _rangeOption = v!;
-              _errorText = null;
-            }),
-          ),
-          if (_rangeOption == 'custom') ...
-            [
-              const SizedBox(height: 8),
-              Row(
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+      contentPadding: const EdgeInsets.all(20),
+      titlePadding: EdgeInsets.zero,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Title
+            const Text(
+              'Generate Audio',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+
+            // Tab bar
+            TabBar(
+              controller: _tabController,
+              tabs: const [Tab(text: 'Offline'), Tab(text: 'Online')],
+              labelColor: Colors.purple,
+              unselectedLabelColor: Colors.grey,
+              indicatorColor: Colors.purple,
+              dividerColor: Colors.transparent,
+            ),
+
+            const SizedBox(height: 12),
+
+            // Tab content
+            SizedBox(
+              height: 260,
+              child: TabBarView(
+                controller: _tabController,
                 children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _fromPageController,
-                      decoration: InputDecoration(
-                        labelText: 'From page',
-                        isDense: true,
-                        helperText: '1-$totalPages',
-                      ),
-                      keyboardType: TextInputType.number,
-                      onChanged: (v) {
-                        _fromPage = int.tryParse(v) ?? _fromPage;
-                        setState(() => _errorText = null);
-                      },
+                  // ── Offline tab ──
+                  SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Select page range:', style: TextStyle(fontSize: 13)),
+                        const SizedBox(height: 8),
+                        RadioListTile<String>(
+                          title: const Text('All pages'),
+                          value: 'all',
+                          groupValue: _rangeOption,
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          onChanged: (v) => setState(() { _rangeOption = v!; _errorText = null; }),
+                        ),
+                        RadioListTile<String>(
+                          title: const Text('Current page onward'),
+                          value: 'current',
+                          groupValue: _rangeOption,
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          onChanged: (v) => setState(() { _rangeOption = v!; _errorText = null; }),
+                        ),
+                        RadioListTile<String>(
+                          title: const Text('Custom range'),
+                          value: 'custom',
+                          groupValue: _rangeOption,
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          onChanged: (v) => setState(() { _rangeOption = v!; _errorText = null; }),
+                        ),
+                        if (_rangeOption == 'custom') ...[
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: TextField(
+                                  controller: _fromPageController,
+                                  decoration: InputDecoration(
+                                    labelText: 'From page',
+                                    isDense: true,
+                                    helperText: '1-$totalPages',
+                                  ),
+                                  keyboardType: TextInputType.number,
+                                  onChanged: (v) {
+                                    _fromPage = int.tryParse(v) ?? _fromPage;
+                                    setState(() => _errorText = null);
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: TextField(
+                                  controller: _toPageController,
+                                  decoration: InputDecoration(
+                                    labelText: 'To page',
+                                    isDense: true,
+                                    helperText: '1-$totalPages',
+                                  ),
+                                  keyboardType: TextInputType.number,
+                                  onChanged: (v) {
+                                    _toPage = int.tryParse(v) ?? _toPage;
+                                    setState(() => _errorText = null);
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                        if (_errorText != null) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            _errorText!,
+                            style: TextStyle(
+                              color: Theme.of(context).colorScheme.error,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: TextField(
-                      controller: _toPageController,
-                      decoration: InputDecoration(
-                        labelText: 'To page',
-                        isDense: true,
-                        helperText: '1-$totalPages',
+
+                  // ── Online tab ──
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Quality filter chips
+                      Row(
+                        children: [
+                          for (final q in [
+                            ('high', 'High', Icons.star),
+                            ('medium', 'Medium', Icons.speed),
+                            ('low', 'Low', Icons.flash_on),
+                          ])
+                            Expanded(
+                              child: Padding(
+                                padding: EdgeInsets.only(right: q.$1 != 'low' ? 6 : 0),
+                                child: GestureDetector(
+                                  onTap: () => setState(() => _selectedQuality = q.$1),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(vertical: 8),
+                                    decoration: BoxDecoration(
+                                      color: _selectedQuality == q.$1
+                                          ? Colors.purple.withValues(alpha: 0.1)
+                                          : Colors.transparent,
+                                      border: Border.all(
+                                        color: _selectedQuality == q.$1 ? Colors.purple : Colors.grey.shade300,
+                                        width: _selectedQuality == q.$1 ? 2 : 1,
+                                      ),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Icon(q.$3, size: 14,
+                                          color: _selectedQuality == q.$1 ? Colors.purple : Colors.grey),
+                                        const SizedBox(width: 4),
+                                        Text(q.$2,
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: _selectedQuality == q.$1 ? FontWeight.bold : FontWeight.normal,
+                                            color: _selectedQuality == q.$1 ? Colors.purple : Colors.grey.shade700,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
-                      keyboardType: TextInputType.number,
-                      onChanged: (v) {
-                        _toPage = int.tryParse(v) ?? _toPage;
-                        setState(() => _errorText = null);
-                      },
-                    ),
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: ListView.builder(
+                          itemCount: voices.length,
+                          itemBuilder: (context, index) {
+                            final voice = voices[index];
+                            final isSelected = _selectedVoiceId == voice.id;
+                            return InkWell(
+                              onTap: () => setState(() => _selectedVoiceId = voice.id),
+                              borderRadius: BorderRadius.circular(10),
+                              child: Container(
+                                margin: const EdgeInsets.only(bottom: 6),
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                decoration: BoxDecoration(
+                                  color: isSelected ? Colors.purple.withValues(alpha: 0.1) : Colors.transparent,
+                                  border: Border.all(
+                                    color: isSelected ? Colors.purple : Colors.grey.shade300,
+                                    width: isSelected ? 2 : 1,
+                                  ),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      voice.gender == 'Male' ? Icons.man : Icons.woman,
+                                      color: voice.gender == 'Male' ? Colors.blue : Colors.pink,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(voice.name, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                                          Text(voice.language, style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+                                        ],
+                                      ),
+                                    ),
+                                    if (isSelected)
+                                      const Icon(Icons.check_circle, color: Colors.purple, size: 18),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
-          if (_errorText != null) ...
-            [
-              const SizedBox(height: 12),
-              Text(
-                _errorText!,
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.error,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-        ],
+            ),
+          ],
+        ),
       ),
       actions: [
         TextButton(
@@ -932,8 +1208,11 @@ class _GenerateAudioDialogState extends State<_GenerateAudioDialog> {
           child: const Text('Cancel'),
         ),
         FilledButton(
-          onPressed: _validateAndGenerate,
-          child: const Text('Generate'),
+          onPressed: _tabController.index == 0 ? _generateOffline : _generateOnline,
+          style: FilledButton.styleFrom(
+            backgroundColor: _tabController.index == 1 ? Colors.purple : null,
+          ),
+          child: Text(_tabController.index == 1 ? 'Generate & Save' : 'Generate'),
         ),
       ],
     );

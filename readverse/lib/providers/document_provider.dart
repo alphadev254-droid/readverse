@@ -7,6 +7,7 @@ import '../services/file_service.dart';
 class DocumentProvider extends ChangeNotifier {
   List<DocumentModel> _allDocuments = [];
   String _searchQuery = '';
+  String? _typeFilter; // null = all types
   bool _isLoading = false;
   String? _error;
 
@@ -16,10 +17,14 @@ class DocumentProvider extends ChangeNotifier {
   String get searchQuery => _searchQuery;
 
   List<DocumentModel> get _filteredDocuments {
-    if (_searchQuery.isEmpty) return List.from(_allDocuments);
-    return _allDocuments
-        .where((d) => d.name.toLowerCase().contains(_searchQuery.toLowerCase()))
-        .toList();
+    var docs = List<DocumentModel>.from(_allDocuments);
+    if (_searchQuery.isNotEmpty) {
+      docs = docs.where((d) => d.name.toLowerCase().contains(_searchQuery.toLowerCase())).toList();
+    }
+    if (_typeFilter != null) {
+      docs = docs.where((d) => d.type.toLowerCase() == _typeFilter).toList();
+    }
+    return docs;
   }
 
   Future<void> loadDocuments() async {
@@ -100,6 +105,11 @@ class DocumentProvider extends ChangeNotifier {
 
   void searchDocuments(String query) {
     _searchQuery = query;
+    notifyListeners();
+  }
+
+  void filterByType(String? type) {
+    _typeFilter = type;
     notifyListeners();
   }
 

@@ -52,6 +52,9 @@ dependencies:
   timeago: ^3.7.0
   path: ^1.9.0
   archive: ^3.6.1
+  
+  # TTS Text Normalization
+  number_to_words: ^1.0.0
 
 dev_dependencies:
   flutter_test:

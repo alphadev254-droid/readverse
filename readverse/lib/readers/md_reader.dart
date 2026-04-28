@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:provider/provider.dart';
 import '../models/document_model.dart';
@@ -29,6 +30,8 @@ class _MdReaderState extends State<MdReader> {
   String _rawMarkdown = '';
   bool _firstLoad = true;
   int _totalPages = 1;
+  int _currentPage = 1;
+  bool _isNavigating = false;
 
   final Map<String, _MdHighlight> _highlights = {};
   String? _flashingId;
@@ -58,7 +61,10 @@ class _MdReaderState extends State<MdReader> {
 
   Future<void> _initialLoad() async {
     if (!mounted) return;
-    final raw = await File(widget.document.filePath).readAsString();
+    
+    // Load markdown file in background isolate to avoid blocking UI
+    final raw = await compute(_loadMarkdownInIsolate, widget.document.filePath);
+    
     if (!mounted) return;
 
     final stored = context.read<HighlightProvider>().highlights;
@@ -81,39 +87,82 @@ class _MdReaderState extends State<MdReader> {
 
     if (!mounted) return;
     _totalPages = (_rawMarkdown.length / 3000).ceil().clamp(1, 99999);
-    final rp = context.read<ReaderProvider>();
-    rp.setTotalPages(_totalPages);
-    rp.setPage(1);
-    rp.registerSliderDragCallback(_scrollToFraction);
+    
+    // Defer provider calls to avoid setState during build
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final rp = context.read<ReaderProvider>();
+      rp.setTotalPages(_totalPages);
+      rp.setPage(1);
+      rp.registerSliderDragCallback(_scrollToFraction);
+      
+      // Start listening to scroll after everything is set up
+      _scrollController.addListener(_onScroll);
+    });
 
     final lastPage = widget.document.lastPage;
     if (lastPage > 1) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToPage(lastPage));
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToPage(lastPage);
+      });
     }
+  }
 
-    _scrollController.addListener(_onScroll);
+  // Static method for isolate execution
+  static Future<String> _loadMarkdownInIsolate(String filePath) async {
+    return await File(filePath).readAsString();
   }
 
   // ── Scroll tracking ────────────────────────────────────────────────────
   void _onScroll() {
+    if (_isNavigating) return;
     if (!_scrollController.hasClients) return;
     final max = _scrollController.position.maxScrollExtent;
     if (max <= 0) return;
-    final fraction = (_scrollController.offset / max).clamp(0.0, 1.0);
-    context.read<ReaderProvider>().setScrollFraction(fraction);
+    
+    // Calculate current page based on scroll position
+    final scrollFraction = (_scrollController.offset / max).clamp(0.0, 1.0);
+    final newPage = (scrollFraction * _totalPages).ceil().clamp(1, _totalPages);
+    
+    // Only update if page changed
+    if (newPage != _currentPage) {
+      _currentPage = newPage;
+      context.read<ReaderProvider>().setPage(_currentPage);
+      // Use page midpoint for slider position
+      final sliderFraction = ((_currentPage - 0.5) / _totalPages).clamp(0.0, 1.0);
+      context.read<ReaderProvider>().setScrollFraction(sliderFraction);
+    }
   }
 
   void _scrollToPage(int page) {
     if (!_scrollController.hasClients) return;
+    _isNavigating = true;
+    _currentPage = page.clamp(1, _totalPages);
+    
     final max = _scrollController.position.maxScrollExtent;
-    final fraction = _totalPages > 1 ? (page - 1) / (_totalPages - 1) : 0.0;
+    final fraction = _totalPages > 1 ? (_currentPage - 1) / (_totalPages - 1) : 0.0;
     _scrollController.jumpTo((fraction * max).clamp(0.0, max));
+    
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (mounted) _isNavigating = false;
+    });
   }
 
   void _scrollToFraction(double fraction) {
     if (!_scrollController.hasClients) return;
+    _isNavigating = true;
+    
+    // Convert fraction to target page
+    final targetPage = ((fraction * _totalPages) + 0.5).floor().clamp(1, _totalPages);
+    _currentPage = targetPage;
+    
     final max = _scrollController.position.maxScrollExtent;
-    _scrollController.jumpTo((fraction * max).clamp(0.0, max));
+    final pageFraction = _totalPages > 1 ? (targetPage - 1) / (_totalPages - 1) : 0.0;
+    _scrollController.jumpTo((pageFraction * max).clamp(0.0, max));
+    
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (mounted) _isNavigating = false;
+    });
   }
 
   // ── Navigate to highlight ──────────────────────────────────────────────
@@ -254,7 +303,24 @@ class _MdReaderState extends State<MdReader> {
 
   @override
   Widget build(BuildContext context) {
-    if (_firstLoad) return const Center(child: CircularProgressIndicator());
+    if (_firstLoad) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 16),
+            Text(
+              'Loading markdown...',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6),
+                fontSize: 14,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
 
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
@@ -296,7 +362,12 @@ class _MdReaderState extends State<MdReader> {
           controller: _scrollController,
           data: _rawMarkdown,
           styleSheet: styleSheet,
-          padding: const EdgeInsets.fromLTRB(20, 24, 20, 120),
+          padding: EdgeInsets.fromLTRB(
+            20, 
+            MediaQuery.of(context).padding.top + 80, // Status bar + top bar height
+            20, 
+            120
+          ),
           selectable: false,
         ),
       ),

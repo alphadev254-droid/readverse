@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  tts-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: readverse-tts
+    ports:
+      - "8880:8880"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8880
+      - LOG_LEVEL=INFO
+      - DEFAULT_VOICE=af_bella
+      - ENABLE_STREAMING=true
+    volumes:
+      - ./models:/app/models
+      - ./output:/app/output
+      - ./temp:/app/temp
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: GPU support (requires nvidia-docker)
+  # tts-api-gpu:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: readverse-tts-gpu
+  #   runtime: nvidia
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=all
+  #   ports:
+  #     - "8880:8880"
+  #   volumes:
+  #     - ./models:/app/models
+  #     - ./output:/app/output
+  #   restart: unless-stopped

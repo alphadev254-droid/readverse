@@ -105,6 +105,37 @@ class _RecordingCard extends StatelessWidget {
                     ],
                   ),
                 ),
+                // Favorite + Library icons
+                IconButton(
+                  icon: Icon(
+                    provider.isFavorite(recording.id)
+                        ? Icons.favorite
+                        : Icons.favorite_border,
+                    size: 20,
+                    color: provider.isFavorite(recording.id)
+                        ? Colors.red
+                        : cs.onSurface.withValues(alpha: 0.4),
+                  ),
+                  onPressed: () => provider.toggleFavorite(recording.id),
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                ),
+                IconButton(
+                  icon: Icon(
+                    provider.isInLibrary(recording.id)
+                        ? Icons.bookmark
+                        : Icons.bookmark_border,
+                    size: 20,
+                    color: provider.isInLibrary(recording.id)
+                        ? cs.primary
+                        : cs.onSurface.withValues(alpha: 0.4),
+                  ),
+                  onPressed: () => provider.toggleLibrary(recording.id),
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                ),
                 PopupMenuButton<String>(
                   icon: Icon(Icons.more_vert,
                       size: 20,
@@ -150,34 +181,46 @@ class _RecordingCard extends StatelessWidget {
                     final pos = posSnap.data ?? Duration.zero;
                     final dur = durSnap.data ?? Duration.zero;
                     final frac = dur.inMilliseconds > 0
-                        ? (pos.inMilliseconds / dur.inMilliseconds)
-                            .clamp(0.0, 1.0)
+                        ? (pos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
                         : 0.0;
                     return Column(
                       children: [
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: LinearProgressIndicator(
+                        SliderTheme(
+                          data: SliderThemeData(
+                            trackHeight: 3,
+                            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                            overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+                            activeTrackColor: cs.primary,
+                            inactiveTrackColor: cs.surfaceContainerHighest,
+                            thumbColor: cs.primary,
+                          ),
+                          child: Slider(
                             value: frac,
-                            minHeight: 4,
-                            backgroundColor: cs.surfaceContainerHighest,
+                            onChanged: dur.inMilliseconds > 0
+                                ? (v) {
+                                    final seekTo = Duration(
+                                      milliseconds: (v * dur.inMilliseconds).round(),
+                                    );
+                                    provider.seekTo(seekTo);
+                                  }
+                                : null,
                           ),
                         ),
-                        const SizedBox(height: 4),
-                        Row(
-                          children: [
-                            Text(_fmt(pos),
-                                style: TextStyle(
-                                    fontSize: 11,
-                                    color: cs.onSurface
-                                        .withValues(alpha: 0.5))),
-                            const Spacer(),
-                            Text(_fmt(dur),
-                                style: TextStyle(
-                                    fontSize: 11,
-                                    color: cs.onSurface
-                                        .withValues(alpha: 0.5))),
-                          ],
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: Row(
+                            children: [
+                              Text(_fmt(pos),
+                                  style: TextStyle(
+                                      fontSize: 11,
+                                      color: cs.onSurface.withValues(alpha: 0.5))),
+                              const Spacer(),
+                              Text(_fmt(dur),
+                                  style: TextStyle(
+                                      fontSize: 11,
+                                      color: cs.onSurface.withValues(alpha: 0.5))),
+                            ],
+                          ),
                         ),
                       ],
                     );
@@ -188,6 +231,41 @@ class _RecordingCard extends StatelessWidget {
 
             // ── Controls ──
             const SizedBox(height: 10),
+            // Speed chips — shown above buttons when active
+            if (_isActive) ...[
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((s) {
+                    final isSelected = (provider.playbackSpeed - s).abs() < 0.01;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 4),
+                      child: GestureDetector(
+                        onTap: () => provider.setPlaybackSpeed(s),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: isSelected
+                                ? cs.primary
+                                : cs.primary.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            '${s}x',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: isSelected ? cs.onPrimary : cs.primary,
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
             Row(
               children: [
                 if (!isPlaying)
@@ -199,8 +277,7 @@ class _RecordingCard extends StatelessWidget {
                     label: Text(isPaused ? 'Resume' : 'Play'),
                     style: FilledButton.styleFrom(
                         minimumSize: const Size(0, 36),
-                        padding:
-                            const EdgeInsets.symmetric(horizontal: 16)),
+                        padding: const EdgeInsets.symmetric(horizontal: 16)),
                   )
                 else
                   FilledButton.icon(
@@ -209,8 +286,7 @@ class _RecordingCard extends StatelessWidget {
                     label: const Text('Pause'),
                     style: FilledButton.styleFrom(
                         minimumSize: const Size(0, 36),
-                        padding:
-                            const EdgeInsets.symmetric(horizontal: 16)),
+                        padding: const EdgeInsets.symmetric(horizontal: 16)),
                   ),
                 if (_isActive) ...[
                   const SizedBox(width: 8),
@@ -220,8 +296,7 @@ class _RecordingCard extends StatelessWidget {
                     label: const Text('Stop'),
                     style: OutlinedButton.styleFrom(
                         minimumSize: const Size(0, 36),
-                        padding:
-                            const EdgeInsets.symmetric(horizontal: 16)),
+                        padding: const EdgeInsets.symmetric(horizontal: 16)),
                   ),
                 ],
               ],

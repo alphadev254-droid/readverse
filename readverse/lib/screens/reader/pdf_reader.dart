@@ -31,10 +31,13 @@ class _PdfReaderState extends State<PdfReader> {
   Uint8List? _pdfBytes;
   bool _firstLoad = true;
   int _currentPage = 1;
-  double _totalContentHeight = 0.0;
-  bool _totalHeightCalculated = false;
+  
+  // Simplified page-only scroll tracking
   bool _isSliderDragging = false;
-  Timer? _scrollDebounce;
+  int _totalPages = 1;
+  
+  // Track if PDF viewer has been built to prevent recreation
+  bool _viewerBuilt = false;
 
   OverlayEntry? _overlayEntry;
   String _selectedText = '';
@@ -63,8 +66,6 @@ class _PdfReaderState extends State<PdfReader> {
 
   @override
   void dispose() {
-    _controller.removeListener(_updateSliderFromScroll);
-    _scrollDebounce?.cancel();
     context.read<ReaderProvider>().unregisterSliderDragCallback();
     _selectionDebounce?.cancel();
     _closeOverlay();
@@ -74,12 +75,20 @@ class _PdfReaderState extends State<PdfReader> {
 
   Future<void> _initialLoad() async {
     if (!mounted) return;
-    final bytes = await File(widget.document.filePath).readAsBytes();
+    
+    // Load PDF in background to avoid blocking UI
+    final bytes = await compute(_loadPdfInIsolate, widget.document.filePath);
+    
     if (!mounted) return;
     setState(() {
       _pdfBytes = bytes;
       _firstLoad = false;
     });
+  }
+
+  // Static method for isolate execution
+  static Future<Uint8List> _loadPdfInIsolate(String filePath) async {
+    return await File(filePath).readAsBytes();
   }
 
   // Navigate: page is stored as PdfTextLine.pageNumber (1-based).
@@ -302,123 +311,107 @@ class _PdfReaderState extends State<PdfReader> {
   @override
   Widget build(BuildContext context) {
     if (_firstLoad || _pdfBytes == null) {
-      return const Center(child: CircularProgressIndicator());
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 16),
+            Text(
+              'Loading PDF...',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6),
+                fontSize: 14,
+              ),
+            ),
+          ],
+        ),
+      );
     }
 
-    return SfPdfViewer.memory(
-      _pdfBytes!,
-      key: _pdfViewerKey,
-      controller: _controller,
-      initialPageNumber: _currentPage,
-      enableTextSelection: true,
-      canShowTextSelectionMenu: false,
-      // Immediately deselect any annotation the user taps.
-      // This prevents the internal annotation toolbar (Tooltip widgets
-      // using SingleTickerProviderStateMixin) from being built, which
-      // caused the RawTooltipState ticker crash on rapid tap/deselect cycles.
-      onAnnotationSelected: (annotation) {
-        // Deselect on next frame so the viewer registers the selection
-        // before we clear it — avoids assertion errors.
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _controller.deselectAnnotation(annotation);
-        });
-      },
-      onDocumentLoaded: (details) {
-        final total = details.document.pages.count;
-        context.read<ReaderProvider>()
-          ..setTotalPages(total)
-          ..setPage(_currentPage);
-        // Add live scroll listener — fires on every scroll/zoom frame
-        _controller.addListener(_updateSliderFromScroll);
-        // Calculate total content height for continuous scroll mapping
-        _calculateTotalContentHeight();
-        // Register slider drag: drags scroll PDF live via jumpTo
-        context.read<ReaderProvider>().registerSliderDragCallback((fraction) {
-          _handleSliderDrag(fraction, total);
-        });
-        _rebuildAnnotationRegistry();
-      },
-      onPageChanged: (details) {
-        _currentPage = details.newPageNumber;
-        // setScrollFraction keeps slider smooth between pages
-        final total = context.read<ReaderProvider>().totalPages;
-        final fraction = total > 1
-            ? (details.newPageNumber - 1) / (total - 1)
-            : 0.0;
-        context.read<ReaderProvider>().setScrollFraction(fraction);
-      },
-      onZoomLevelChanged: (_) {
-        // Recalculate total height after zoom so fraction stays accurate
-        _calculateTotalContentHeight();
-      },
+    return Padding(
+      padding: EdgeInsets.only(
+        top: MediaQuery.of(context).padding.top + 60, // Top bar height
+      ),
+      child: SfPdfViewer.memory(
+        _pdfBytes!,
+        key: _pdfViewerKey,
+        controller: _controller,
+        initialPageNumber: _currentPage,
+        enableTextSelection: true,
+        canShowTextSelectionMenu: false,
+        // Performance: Enable page caching for smoother scrolling
+        pageSpacing: 4,
+        // Immediately deselect any annotation the user taps.
+        // This prevents the internal annotation toolbar (Tooltip widgets
+        // using SingleTickerProviderStateMixin) from being built, which
+        // caused the RawTooltipState ticker crash on rapid tap/deselect cycles.
+        onAnnotationSelected: (annotation) {
+          // Deselect on next frame so the viewer registers the selection
+          // before we clear it — avoids assertion errors.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _controller.deselectAnnotation(annotation);
+          });
+        },
+        onDocumentLoaded: (details) {
+          final total = details.document.pages.count;
+          _totalPages = total;
+          _viewerBuilt = true; // Mark as built
+          
+          context.read<ReaderProvider>()
+            ..setTotalPages(total)
+            ..setPage(_currentPage);
+          
+          // Register slider drag callback
+          context.read<ReaderProvider>().registerSliderDragCallback((fraction) {
+            _handleSliderDrag(fraction, total);
+          });
+          
+          _rebuildAnnotationRegistry();
+        },
+        onPageChanged: (details) {
+          if (_isSliderDragging) return; // Slider is driving, don't write back
+          
+          _currentPage = details.newPageNumber;
+          context.read<ReaderProvider>().setPage(_currentPage);
+          
+          final total = _totalPages;
+          if (total <= 1) {
+            context.read<ReaderProvider>().setScrollFraction(0.0);
+            return;
+          }
+          
+          // Page-only fraction: use midpoint of current page for smooth feel
+          final fraction = ((_currentPage - 0.5) / total).clamp(0.0, 1.0);
+          context.read<ReaderProvider>().setScrollFraction(fraction);
+        },
+        onZoomLevelChanged: (_) {
+          // No action needed for page-only tracking
+        },
       onTextSelectionChanged: _onTextSelectionChanged,
+      ),
     );
   }
 
   // ── Live scroll ↔ slider sync ──────────────────────────────────────────
 
-  /// Calculates total scrollable content height by jumping to first/last page.
-  /// Called once on load and again after zoom changes.
-  Future<void> _calculateTotalContentHeight() async {
-    if (!mounted) return;
-    if (_controller.pageCount <= 1) {
-      _totalContentHeight = 0.0;
-      return;
-    }
-
-    final originalOffset = _controller.scrollOffset;
-
-    try {
-      _controller.jumpToPage(1);
-      await Future.delayed(const Duration(milliseconds: 80));
-      if (!mounted) return;
-      final startY = _controller.scrollOffset.dy;
-
-      _controller.jumpToPage(_controller.pageCount);
-      await Future.delayed(const Duration(milliseconds: 80));
-      if (!mounted) return;
-      final endY = _controller.scrollOffset.dy;
-
-      _totalContentHeight =
-          (endY - startY).abs().clamp(1.0, double.infinity);
-    } finally {
-      if (mounted) _controller.jumpTo(yOffset: originalOffset.dy);
-    }
-  }
-
-  /// Called by controller.addListener — fires on every scroll frame.
-  /// Skipped while slider is being dragged to prevent feedback loop.
-  void _updateSliderFromScroll() {
-    if (!mounted || _isSliderDragging) return;
-    final provider = context.read<ReaderProvider>();
-    if (_totalContentHeight <= 0) return;
-
-    // ~60fps debounce — reduces update frequency without losing smoothness
-    _scrollDebounce?.cancel();
-    _scrollDebounce = Timer(const Duration(milliseconds: 16), () {
-      if (!mounted || _isSliderDragging) return;
-      final fraction =
-          (_controller.scrollOffset.dy / _totalContentHeight).clamp(0.0, 1.0);
-      provider.setScrollFraction(fraction);
-    });
-  }
-
   /// Called by slider drag via registerSliderDragCallback.
-  /// Locks _isSliderDragging so _updateSliderFromScroll is suppressed
-  /// during the drag — prevents the oscillation feedback loop.
+  /// Simplified page-only navigation.
   void _handleSliderDrag(double fraction, int totalPages) {
-    if (_totalContentHeight <= 0) {
-      final page =
-          totalPages > 1 ? (fraction * (totalPages - 1)).round() + 1 : 1;
-      _controller.jumpToPage(page.clamp(1, totalPages));
-      return;
-    }
-
     _isSliderDragging = true;
-    _controller.jumpTo(yOffset: fraction * _totalContentHeight);
 
-    // Release lock after PDF has settled
-    Future.delayed(const Duration(milliseconds: 80), () {
+    // Convert fraction to target page (1-based)
+    // Add 0.5 to round to nearest page
+    final targetPage = ((fraction * totalPages) + 0.5)
+        .floor()
+        .clamp(1, totalPages);
+
+    _controller.jumpToPage(targetPage);
+    _currentPage = targetPage;
+    context.read<ReaderProvider>().setPage(_currentPage);
+
+    // Release lock after navigation settles
+    Future.delayed(const Duration(milliseconds: 400), () {
       if (mounted) _isSliderDragging = false;
     });
   }

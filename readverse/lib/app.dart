@@ -10,6 +10,7 @@ import 'providers/highlight_provider.dart';
 import 'providers/theme_provider.dart';
 import 'providers/settings_provider.dart';
 import 'providers/read_aloud_provider.dart';
+import 'providers/streaming_tts_provider.dart';
 import 'providers/recording_provider.dart';
 import 'config/app_theme.dart';
 import 'routes/app_router.dart';
@@ -41,14 +42,9 @@ class _ReadVerseAppState extends State<ReadVerseApp> {
         ChangeNotifierProvider(create: (_) => FavoritesProvider()),
         ChangeNotifierProvider(create: (_) => ReaderProvider()),
         ChangeNotifierProvider(create: (_) => ReadAloudProvider()),
-        // RecordingProvider shares the TTS engine from ReadAloudProvider
-        ChangeNotifierProxyProvider<ReadAloudProvider, RecordingProvider>(
-          create: (_) => RecordingProvider(),
-          update: (_, readAloud, recording) {
-            recording!.setTts(readAloud.tts);
-            return recording;
-          },
-        ),
+        ChangeNotifierProvider(create: (_) => StreamingTtsProvider()),
+        // RecordingProvider now uses its own dedicated TTS engine
+        ChangeNotifierProvider(create: (_) => RecordingProvider()),
         ChangeNotifierProvider(create: (_) => BookmarkProvider()),
         ChangeNotifierProvider(create: (_) => HighlightProvider()),
         ChangeNotifierProvider(create: (_) => SettingsProvider()),
@@ -69,3 +65,4 @@ class _ReadVerseAppState extends State<ReadVerseApp> {
     );
   }
 }
+
